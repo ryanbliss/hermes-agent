@@ -66,6 +66,7 @@ async def test_handoff_thread_is_public_and_origin_user_can_be_enrolled():
     assert enrolled is True
     create_kwargs = parent.create_thread.await_args.kwargs
     assert create_kwargs["type"] is sys.modules["discord"].ChannelType.public_thread
+    assert "777" in adapter._threads
     object_factory.assert_called_once_with(id=42)
     thread.add_user.assert_awaited_once_with(object_factory.return_value)
 

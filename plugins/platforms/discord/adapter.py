@@ -6724,6 +6724,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=1440,
                     reason=reason,
                 )
+                # Cron/handoff threads are bot-owned conversations. Persist
+                # participation immediately so ordinary replies bypass the
+                # server-channel @mention gate, including after a restart.
+                self._threads.mark(str(thread.id))
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(
@@ -6742,6 +6746,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=1440,
                 reason=reason,
             )
+            self._threads.mark(str(thread.id))
             return str(thread.id)
         except Exception as fallback_error:
             logger.warning(

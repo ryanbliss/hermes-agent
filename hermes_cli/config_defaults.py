@@ -2038,6 +2038,10 @@ DEFAULT_CONFIG = {
         # default while running full unattended test suites. This is a hard
         # per-turn ceiling, separate from the activity-based cron watchdog.
         "codex_turn_timeout_seconds": 3600,
+        # Create continuable messaging threads before an agent run and post
+        # explicit commentary + tool activity while it works. Hidden model
+        # reasoning is never surfaced. Opt-in to avoid noisy cron channels.
+        "live_thread_updates": False,
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when
