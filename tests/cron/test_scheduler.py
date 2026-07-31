@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -417,6 +418,58 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+
+    def test_final_delivery_reuses_preopened_live_thread(self):
+        """The final response must stay in the thread opened before the run."""
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = SimpleNamespace(success=True, raw_response={})
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "live-final",
+            "name": "Daily checks",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "1234", "user_id": "U42"},
+            "attach_to_session": True,
+            "_live_thread_id": "9001",
+            "_live_thread_seeded": True,
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), patch(
+            "cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}},
+        ), patch(
+            "asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro,
+        ), patch(
+            "cron.scheduler._open_continuable_cron_thread",
+        ) as open_thread, patch(
+            "cron.scheduler._mirror_live_cron_thread_message", return_value=True,
+        ) as mirror:
+            assert _deliver_result(
+                job, "All checks passed.",
+                adapters={Platform.DISCORD: adapter}, loop=loop,
+            ) is None
+
+        open_thread.assert_not_called()
+        metadata = adapter.send.await_args.kwargs["metadata"]
+        assert metadata["thread_id"] == "9001"
+        mirror.assert_called_once_with("discord", "1234", "9001", "All checks passed.")
 
 
 class TestDeliverResultErrorReturns:
@@ -1733,6 +1786,79 @@ class TestCronDeliveryMirror:
         mirror_mock.assert_called_once()
         assert mirror_mock.call_args.kwargs.get("thread_id") == "9001"
 
+    def test_seed_discord_thread_uses_inbound_thread_chat_id(self):
+        from cron.scheduler import _seed_cron_thread_session
+
+        store = MagicMock()
+        adapter = MagicMock()
+        adapter._session_store = store
+        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            _seed_cron_thread_session(
+                {"id": "j1"}, adapter, "discord", "parent-123", "thread-9001",
+                "Run the checks", chat_name="Checks",
+            )
+
+        seeded = store.get_or_create_session.call_args.args[0]
+        assert seeded.chat_id == "thread-9001"
+        assert seeded.thread_id == "thread-9001"
+        assert seeded.parent_chat_id == "parent-123"
+        assert mirror_mock.call_args.args[1] == "thread-9001"
+
+    def test_prepare_live_thread_streams_callbacks_and_seeds_session(self):
+        from cron.scheduler import _prepare_live_cron_thread
+
+        adapter = MagicMock()
+        transport = SimpleNamespace(adapter=adapter)
+        job = {
+            "id": "j1",
+            "name": "Daily checks",
+            "prompt": "Run all checks",
+            "deliver": "origin",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "parent-123",
+                "user_id": "U42",
+            },
+            "attach_to_session": True,
+        }
+        loop = MagicMock()
+        with patch("cron.scheduler.load_config", return_value={
+            "cron": {"live_thread_updates": True},
+        }), patch(
+            "gateway.config.load_gateway_config", return_value=MagicMock(),
+        ), patch(
+            "gateway.delivery.resolve_delivery_transport", return_value=transport,
+        ), patch(
+            "cron.scheduler._open_continuable_cron_thread", return_value="9001",
+        ), patch(
+            "cron.scheduler._add_continuable_cron_thread_member", return_value=True,
+        ) as enroll, patch(
+            "cron.scheduler._seed_cron_thread_session",
+        ) as seed, patch(
+            "cron.scheduler._send_live_cron_thread_update", return_value=True,
+        ) as send, patch(
+            "cron.scheduler._mirror_live_cron_thread_message", return_value=True,
+        ) as mirror:
+            callbacks = _prepare_live_cron_thread(job, {}, loop)
+            callbacks["tool_progress_callback"]("tool.started", "terminal")
+            callbacks["interim_assistant_callback"]("I found the test project.")
+
+        assert job["_live_thread_id"] == "9001"
+        assert job["_live_thread_seeded"] is True
+        enroll.assert_called_once_with(job, adapter, "9001", "U42", loop)
+        seed.assert_called_once()
+        assert send.call_count == 3
+        assert mirror.call_count == 2
+
+    def test_live_thread_feature_is_opt_in(self):
+        from cron.scheduler import _prepare_live_cron_thread
+
+        with patch("cron.scheduler.load_config", return_value={"cron": {}}), patch(
+            "cron.scheduler._open_continuable_cron_thread",
+        ) as open_thread:
+            assert _prepare_live_cron_thread({"id": "j1"}, {}, MagicMock()) is None
+        open_thread.assert_not_called()
+
 
 class TestCronContinuableSurfaceInChannel:
     """cron_continuable_surface: in_channel — deliver a continuable cron FLAT
@@ -1954,4 +2080,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-

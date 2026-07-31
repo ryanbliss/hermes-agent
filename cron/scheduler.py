@@ -808,6 +808,190 @@ def _add_continuable_cron_thread_member(
         return False
 
 
+def _send_live_cron_thread_update(
+    adapter,
+    chat_id: str,
+    thread_id: str,
+    content: str,
+    loop,
+) -> bool:
+    """Synchronously enqueue one ordered update on the gateway event loop."""
+    text = str(content or "").strip()
+    if not text or loop is None:
+        return False
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        coro = adapter.send(
+            str(chat_id),
+            text,
+            metadata={"thread_id": str(thread_id)},
+        )
+        future = safe_schedule_threadsafe(coro, loop)  # type: ignore[arg-type]
+        if future is None:
+            return False
+        result = future.result(timeout=30)
+        if isinstance(result, dict):
+            return bool(result.get("success", not result.get("error")))
+        return bool(getattr(result, "success", True))
+    except Exception as e:
+        logger.warning(
+            "Live cron update failed for thread %s: %s", thread_id, e,
+        )
+        return False
+
+
+def _cron_thread_session_chat_id(
+    platform_name: str,
+    parent_chat_id: str,
+    thread_id: str,
+) -> str:
+    """Return the chat id used by inbound messages for a created thread."""
+    if str(platform_name).strip().lower() == "discord":
+        return str(thread_id)
+    return str(parent_chat_id)
+
+
+def _mirror_live_cron_thread_message(
+    platform_name: str,
+    parent_chat_id: str,
+    thread_id: str,
+    content: str,
+) -> bool:
+    """Append a visible live update to the thread's gateway transcript."""
+    text = str(content or "").strip()
+    if not text:
+        return False
+    try:
+        from gateway.mirror import mirror_to_session
+
+        return bool(mirror_to_session(
+            platform_name,
+            _cron_thread_session_chat_id(
+                platform_name, parent_chat_id, thread_id,
+            ),
+            text,
+            source_label="cron-live",
+            thread_id=str(thread_id),
+            role="assistant",
+        ))
+    except Exception as exc:
+        logger.debug(
+            "Live cron transcript mirror failed for %s:%s: %s",
+            platform_name, thread_id, exc,
+        )
+        return False
+
+
+def _prepare_live_cron_thread(job: dict, adapters, loop) -> Optional[dict]:
+    """Open a continuable origin thread before execution and build callbacks.
+
+    Returns callback kwargs for ``run_job``. Unsupported/non-live delivery
+    paths return ``None`` and retain the historical final-only behavior.
+    """
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        if not bool((cron_cfg or {}).get("live_thread_updates", False)):
+            return None
+    except Exception:
+        return None
+    if not _cron_mirror_delivery_enabled(job, cfg):
+        return None
+
+    origin = _resolve_origin(job) or {}
+    platform_name = str(origin.get("platform") or "").strip().lower()
+    chat_id = origin.get("chat_id")
+    user_id = origin.get("user_id")
+    if not platform_name or not chat_id or origin.get("thread_id"):
+        return None
+    targets = _resolve_delivery_targets(job)
+    if not any(
+        _target_matches_origin(origin, t["platform"], t["chat_id"], t.get("thread_id"))
+        for t in targets
+    ):
+        return None
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+        from gateway.delivery import resolve_delivery_transport
+
+        platform = Platform(platform_name)
+        transport = resolve_delivery_transport(
+            platform, load_gateway_config(), adapters,
+        )
+    except Exception as e:
+        logger.debug("Job '%s': live thread transport unavailable: %s", job.get("id"), e)
+        return None
+    if transport is None or loop is None:
+        return None
+
+    adapter = transport.adapter
+    thread_id = _open_continuable_cron_thread(job, adapter, str(chat_id), loop)
+    if not thread_id:
+        return None
+    _add_continuable_cron_thread_member(job, adapter, thread_id, user_id, loop)
+    job["_live_thread_id"] = str(thread_id)
+
+    # Create the exact thread-keyed gateway session before work starts, so an
+    # ordinary user reply is continuable immediately without an @mention.
+    _seed_cron_thread_session(
+        job,
+        adapter,
+        platform_name,
+        str(chat_id),
+        str(thread_id),
+        str(job.get("prompt") or job.get("name") or "Scheduled job"),
+        chat_name=origin.get("chat_name"),
+    )
+    job["_live_thread_seeded"] = True
+
+    kickoff = f"⏱️ Started scheduled job: **{job.get('name') or job.get('id', 'cron')}**"
+    if _send_live_cron_thread_update(
+        adapter, str(chat_id), thread_id, kickoff, loop,
+    ):
+        _mirror_live_cron_thread_message(
+            platform_name, str(chat_id), thread_id, kickoff,
+        )
+
+    def _tool_progress(
+        event_type: str,
+        tool_name: str = None,
+        preview=None,
+        args=None,
+        **kwargs,
+    ) -> None:
+        if not tool_name or tool_name == "_thinking":
+            return
+        if event_type == "tool.started":
+            _send_live_cron_thread_update(
+                adapter, str(chat_id), thread_id,
+                f"🔧 Running `{tool_name}`", loop,
+            )
+        elif event_type == "tool.completed" and kwargs.get("is_error"):
+            _send_live_cron_thread_update(
+                adapter, str(chat_id), thread_id,
+                f"⚠️ `{tool_name}` failed", loop,
+            )
+
+    def _interim(text: str, **_kwargs) -> None:
+        if _send_live_cron_thread_update(
+            adapter, str(chat_id), thread_id, str(text), loop,
+        ):
+            _mirror_live_cron_thread_message(
+                platform_name, str(chat_id), thread_id, str(text),
+            )
+
+    logger.info(
+        "Job '%s': opened live progress thread %s on %s:%s",
+        job.get("id", "?"), thread_id, platform_name, chat_id,
+    )
+    return {
+        "tool_progress_callback": _tool_progress,
+        "interim_assistant_callback": _interim,
+    }
+
+
 def _seed_cron_thread_session(
     job: dict,
     adapter,
@@ -845,14 +1029,18 @@ def _seed_cron_thread_session(
             except (ValueError, KeyError):
                 platform_enum = None
             if platform_enum is not None:
+                session_chat_id = _cron_thread_session_chat_id(
+                    platform_name, str(chat_id), str(thread_id),
+                )
                 dest_source = SessionSource(
                     platform=platform_enum,
-                    chat_id=str(chat_id),
+                    chat_id=session_chat_id,
                     chat_name=chat_name,
                     chat_type="thread",
                     user_id="system:cron",
                     user_name="Cron",
                     thread_id=str(thread_id),
+                    parent_chat_id=str(chat_id),
                 )
                 # Ensure the thread-keyed session row exists so the mirror has
                 # a target and the user's later reply joins the same session.
@@ -867,7 +1055,9 @@ def _seed_cron_thread_session(
         # thread-keyed session row we just created.
         mirror_to_session(
             platform_name,
-            str(chat_id),
+            _cron_thread_session_chat_id(
+                platform_name, str(chat_id), str(thread_id),
+            ),
             f"[Cron delivery: {job.get('name') or job.get('id', 'cron')}]\n{text}",
             source_label="cron",
             thread_id=str(thread_id),
@@ -1725,9 +1915,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # session and a flat ``(platform, chat_id, None)`` row is otherwise
         # absent for a ``chat_postMessage`` delivery, so the seed must create
         # the row first (F5).
-        thread_seeded = False
+        preopened_thread_id = (
+            str(job.get("_live_thread_id"))
+            if job.get("_live_thread_id") and mirror_this_target
+            else None
+        )
+        thread_seeded = bool(
+            preopened_thread_id and job.get("_live_thread_seeded")
+        )
         opened_thread_id: Optional[str] = None
-        if (
+        if preopened_thread_id and not in_channel_surface and not thread_id:
+            # Live progress already opened this thread before agent execution;
+            # keep final delivery in that same conversation.
+            thread_id = preopened_thread_id
+            opened_thread_id = preopened_thread_id
+        elif (
             mirror_this_target
             and not in_channel_surface
             and runtime_adapter is not None
@@ -2002,6 +2204,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
+                    elif opened_thread_id and thread_seeded and mirror_text:
+                        # A pre-opened live thread already contains the cron
+                        # brief. Persist the final as the assistant's reply.
+                        _mirror_live_cron_thread_message(
+                            platform_name, chat_id, opened_thread_id, mirror_text,
+                        )
                     # in_channel surface: CREATE + seed the flat channel/DM
                     # session (the shipped mirror only appends to an existing
                     # session — the flat row is otherwise absent for a
@@ -2785,7 +2993,11 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    tool_progress_callback=None,
+    interim_assistant_callback=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3539,6 +3751,8 @@ def run_job(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            tool_progress_callback=tool_progress_callback,
+            interim_assistant_callback=interim_assistant_callback,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -3976,8 +4190,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
+            _live_callbacks = _prepare_live_cron_thread(job, adapters, loop) or {}
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job,
+                defer_agent_teardown=_deferred_agents,
+                **_live_callbacks,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4110,6 +4327,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        # These fields route one occurrence only and must never be persisted or
+        # reused by the next recurring run.
+        job.pop("_live_thread_id", None)
+        job.pop("_live_thread_seeded", None)
 
 
 def _notify_provider_jobs_changed() -> None:
