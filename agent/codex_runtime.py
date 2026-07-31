@@ -459,6 +459,22 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
 
+    def _touch_activity(desc: str) -> None:
+        """Keep Hermes' gateway/cron inactivity watchdog in sync with Codex.
+
+        The app-server runtime bypasses Hermes' native provider and tool loops,
+        so their normal ``_touch_activity`` calls never run.  Without this
+        bridge a healthy, tool-heavy Codex turn still looks permanently stuck
+        at ``initializing`` and cron aborts it after the inactivity limit.
+        """
+        touch = getattr(agent, "_touch_activity", None)
+        if touch is None:
+            return
+        try:
+            touch(desc)
+        except Exception:
+            logger.debug("_touch_activity raised for codex event", exc_info=True)
+
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
         live TUI tool card correlates with the same tool call after the
@@ -486,6 +502,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         args = _codex_item_to_args(item)
         if item_id:
             started[item_id] = (name, args, time.monotonic())
+        agent._current_tool = name
+        _touch_activity(f"codex tool started: {name}")
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
@@ -523,6 +541,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         elif prior is not None:
             duration = time.monotonic() - prior[2]
         result, is_error = _codex_item_completion_payload(item)
+        agent._current_tool = None
+        status = " with error" if is_error else ""
+        _touch_activity(f"codex tool completed: {name}{status}")
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
@@ -547,6 +568,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        _touch_activity("receiving codex response")
         fn = getattr(agent, "_fire_stream_delta", None)
         if fn is None:
             return
@@ -559,6 +581,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        _touch_activity("receiving codex reasoning")
         fn = getattr(agent, "_fire_reasoning_delta", None)
         if fn is None:
             return
@@ -570,6 +593,18 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
         if not isinstance(text, str) or not text.strip():
+            return
+        # Modern Codex app-server versions classify assistant messages by
+        # phase.  Commentary belongs on Hermes' interim-message path, but the
+        # final answer is returned normally after the turn completes.  Sending
+        # a ``final_answer`` item here as well makes Discord/Telegram receive
+        # the same terminal response twice.
+        #
+        # Keep the phase-less behavior for older app-server versions, where
+        # every completed agentMessage was the only available signal for
+        # mid-turn narration.
+        phase = str(item.get("phase") or "").strip().lower()
+        if phase in {"final", "final_answer"}:
             return
         # display.show_commentary=false — mid-turn narration stays off the
         # visible interim path on this runtime too (same contract as the
@@ -593,6 +628,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}
+        if method in {"turn/started", "turn/completed"}:
+            _touch_activity(method.replace("/", " "))
+        if method == "item/commandExecution/outputDelta":
+            name = getattr(agent, "_current_tool", None) or "exec_command"
+            _touch_activity(f"receiving codex tool output: {name}")
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return
@@ -695,7 +735,28 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        agent._api_call_count += 1
+        agent._touch_activity(
+            f"starting Codex app-server turn #{agent._api_call_count}"
+        )
+        turn_kwargs = {}
+        if str(getattr(agent, "platform", "") or "").lower() == "cron":
+            try:
+                from hermes_cli.config import load_config
+
+                cron_cfg = (load_config() or {}).get("cron", {}) or {}
+                timeout = float(cron_cfg.get("codex_turn_timeout_seconds", 3600))
+                if timeout > 0:
+                    turn_kwargs["turn_timeout"] = timeout
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid cron.codex_turn_timeout_seconds; using 3600s"
+                )
+                turn_kwargs["turn_timeout"] = 3600.0
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            **turn_kwargs,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

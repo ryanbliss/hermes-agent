@@ -4975,6 +4975,26 @@ class TestCronDeliveryMirror:
             )
         assert tid is None
 
+    def test_origin_user_is_enrolled_in_new_thread_when_supported(self):
+        from cron.scheduler import _add_continuable_cron_thread_member
+
+        adapter = MagicMock()
+        adapter.add_handoff_thread_member = AsyncMock(return_value=True)
+
+        def _run_now(coro, _loop):
+            coro.close()
+            fut = MagicMock()
+            fut.result.return_value = True
+            return fut
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            enrolled = _add_continuable_cron_thread_member(
+                {"id": "j1"}, adapter, "9001", "U42", loop=MagicMock(),
+            )
+
+        assert enrolled is True
+        adapter.add_handoff_thread_member.assert_called_once_with("9001", "U42")
+
     def test_open_thread_none_without_capability_or_loop(self):
         """No create_handoff_thread attr, or no loop → None (no crash)."""
         from cron.scheduler import _open_continuable_cron_thread

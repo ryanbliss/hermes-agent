@@ -1250,6 +1250,29 @@ class TestSessionRetirement:
         )
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
+    def test_commentary_without_turn_completed_is_not_promoted_to_final(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "phase": "commentary",
+                "text": "I am switching to the publish workflow now.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "finish the task",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is True
+        assert r.error and "timed out" in r.error
+        assert r.should_retire is True
+
     def test_post_tool_quiet_watchdog_trips_and_retires(self):
         client = FakeClient()
         # One tool completion, then total silence — no further events,
@@ -1341,6 +1364,63 @@ class TestSessionRetirement:
         # Should NOT be a retirement case.
         assert r.tool_iterations == 1
         assert r.final_text == "tool finished"
+        assert r.should_retire is False
+        assert r.interrupted is False
+
+    def test_post_tool_watchdog_resets_on_unprojected_tool_start(self):
+        """A code-mode tool start is live activity even when its item type
+        produces no projected Hermes message until completion."""
+
+        class DelayedCompletionClient(FakeClient):
+            release_turn_complete_at = None
+
+            def take_notification(self, timeout: float = 0.0):
+                if self._notifications:
+                    next_note = self._notifications[0]
+                    method = next_note.get("method")
+                    if method == "item/started":
+                        note = self._notifications.pop(0)
+                        self.release_turn_complete_at = time.monotonic() + 0.1
+                        return note
+                    if (
+                        method == "turn/completed"
+                        and self.release_turn_complete_at is not None
+                        and time.monotonic() < self.release_turn_complete_at
+                    ):
+                        time.sleep(0.005)
+                        return None
+                return super().take_notification(timeout)
+
+        client = DelayedCompletionClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "dynamicToolCall", "id": "dyn1",
+                "tool": "write_stdin", "arguments": {"session_id": 7},
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "tool, then another live tool", turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+            post_tool_quiet_timeout=0.05,
+        )
+        assert r.error is None
         assert r.should_retire is False
         assert r.interrupted is False
 

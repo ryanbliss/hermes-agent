@@ -6720,6 +6720,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if create is not None:
                 thread = await create(
                     name=thread_name,
+                    type=discord.ChannelType.public_thread,
                     auto_archive_duration=1440,
                     reason=reason,
                 )
@@ -6748,6 +6749,41 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def add_handoff_thread_member(
+        self,
+        thread_id: str,
+        user_id: str,
+    ) -> bool:
+        """Join the originating Discord user to a bot-created handoff thread.
+
+        Discord does not automatically enroll a user when a bot creates a
+        channel-level thread. Without explicit membership the public thread is
+        reachable but does not appear in that user's joined-thread sidebar.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        try:
+            resolved_thread_id = int(thread_id)
+            resolved_user_id = int(user_id)
+        except (TypeError, ValueError):
+            return False
+
+        try:
+            thread = self._client.get_channel(resolved_thread_id)
+            if thread is None:
+                thread = await self._client.fetch_channel(resolved_thread_id)
+            add_user = getattr(thread, "add_user", None)
+            if add_user is None:
+                return False
+            await add_user(discord.Object(id=resolved_user_id))
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[%s] Handoff thread: failed to add user %s to thread %s: %s",
+                self.name, user_id, thread_id, exc,
+            )
+            return False
 
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""

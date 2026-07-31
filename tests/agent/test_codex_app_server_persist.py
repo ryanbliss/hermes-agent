@@ -26,7 +26,7 @@ duplicate the user turn (#860 / #42039). This test locks in:
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.codex_runtime import run_codex_app_server_turn
 from hermes_state import SessionDB
@@ -74,6 +74,27 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["completed"] is True
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+
+
+def test_cron_codex_turn_uses_configured_long_timeout():
+    agent = _make_agent(session_db=None)
+    agent.platform = "cron"
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value={"cron": {"codex_turn_timeout_seconds": 2700}},
+    ):
+        run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-1",
+        )
+
+    agent._codex_session.run_turn.assert_called_once_with(
+        user_input="hello",
+        turn_timeout=2700.0,
+    )
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():
