@@ -471,7 +471,7 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: float = 1500.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
@@ -566,6 +566,7 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        terminal_agent_message_seen = False
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -686,6 +687,24 @@ class CodexAppServerSession:
                 )
                 continue
 
+            if method == "item/completed":
+                item = (note.get("params") or {}).get("item") or {}
+                if item.get("type") == "agentMessage":
+                    phase = str(item.get("phase") or "").strip().lower()
+                    terminal_agent_message_seen = (
+                        not phase or phase in {"final", "final_answer"}
+                    )
+
+            # A newly-started item or streamed delta proves Codex is actively
+            # doing more work after the previous tool completed.  Clear the
+            # post-tool quiet watchdog even when the projector does not turn
+            # that notification into a Hermes message (for example Codex
+            # code-mode ``write_stdin`` calls).  Token-usage/status noise is
+            # intentionally excluded so a genuinely wedged post-tool turn is
+            # still retired.
+            if method == "item/started" or method.endswith("Delta"):
+                last_tool_completion_at = None
+
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -762,6 +781,7 @@ class CodexAppServerSession:
             and not result.interrupted
             and result.final_text
             and result.error is None
+            and terminal_agent_message_seen
         ):
             logger.warning(
                 "codex app-server turn reached deadline after a completed "

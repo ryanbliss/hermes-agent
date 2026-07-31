@@ -39,6 +39,8 @@ def _make_stub_agent() -> SimpleNamespace:
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
+        _touch_activity=MagicMock(name="_touch_activity"),
+        _current_tool=None,
     )
 
 
@@ -178,6 +180,38 @@ class TestStreamDeltaDispatch:
 
 
 class TestToolProgressDispatch:
+    def test_tool_events_update_activity_and_current_tool(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "commandExecution",
+            "id": "exec-activity",
+            "command": "npm test",
+        }))
+        assert agent._current_tool == "exec_command"
+        agent._touch_activity.assert_called_with(
+            "codex tool started: exec_command"
+        )
+
+        bridge({
+            "method": "item/commandExecution/outputDelta",
+            "params": {"delta": "tests running"},
+        })
+        agent._touch_activity.assert_called_with(
+            "receiving codex tool output: exec_command"
+        )
+
+        bridge(_item_completed({
+            "type": "commandExecution",
+            "id": "exec-activity",
+            "exitCode": 0,
+            "aggregatedOutput": "ok",
+        }))
+        assert agent._current_tool is None
+        agent._touch_activity.assert_called_with(
+            "codex tool completed: exec_command"
+        )
+
     def test_command_started_fires_tool_started(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
@@ -262,6 +296,41 @@ class TestAgentMessageInterimDispatch:
             {"role": "assistant", "content": "I'll check the config first."}
         )
 
+    def test_commentary_phase_emits_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-commentary",
+            "phase": "commentary",
+            "text": "I'm checking the project now.",
+        }))
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "I'm checking the project now."}
+        )
+
+    @pytest.mark.parametrize("phase", ["final_answer", "final"])
+    def test_final_phase_does_not_emit_interim(self, phase):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-final",
+            "phase": phase,
+            "text": "This should only use the normal final delivery path.",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
+    def test_empty_text_does_not_emit_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-2", "text": "   ",
+        }))
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-3", "text": ""
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
 
 
     def test_show_commentary_off_suppresses_interim(self):

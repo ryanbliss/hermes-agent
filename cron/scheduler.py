@@ -781,6 +781,33 @@ def _open_continuable_cron_thread(
         return None
 
 
+def _add_continuable_cron_thread_member(
+    job: dict,
+    adapter,
+    thread_id: str,
+    user_id: Optional[str],
+    loop,
+) -> bool:
+    """Enroll the origin user in a newly-created cron thread when supported."""
+    add_member = getattr(adapter, "add_handoff_thread_member", None)
+    if not user_id or not callable(add_member) or loop is None:
+        return False
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        coro = add_member(str(thread_id), str(user_id))
+        future = safe_schedule_threadsafe(coro, loop)  # type: ignore[arg-type]
+        if future is None:
+            return False
+        return bool(future.result(timeout=30))
+    except Exception as e:
+        logger.warning(
+            "Job '%s': failed to enroll origin user %s in thread %s: %s",
+            job.get("id", "?"), user_id, thread_id, e,
+        )
+        return False
+
+
 def _seed_cron_thread_session(
     job: dict,
     adapter,
@@ -1711,6 +1738,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job, runtime_adapter, chat_id, loop,
             )
             if new_thread_id:
+                _add_continuable_cron_thread_member(
+                    job,
+                    runtime_adapter,
+                    new_thread_id,
+                    origin_user_id,
+                    loop,
+                )
                 # Route THIS delivery into the new thread now (the send needs the
                 # thread_id), but defer seeding the thread session until the
                 # delivery actually succeeds — otherwise an open-succeeds /

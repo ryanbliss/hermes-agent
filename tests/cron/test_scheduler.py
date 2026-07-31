@@ -1654,6 +1654,61 @@ class TestCronDeliveryMirror:
             )
         assert tid == "9001"
 
+    def test_open_thread_returns_none_on_dm_platform(self):
+        """A DM-only adapter (WhatsApp) inherits the base create_handoff_thread
+        that returns None → _open_continuable_cron_thread returns None so the
+        caller falls back to DM-session mirroring."""
+        from cron.scheduler import _open_continuable_cron_thread
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value=None)
+
+        def _run_now(coro, _loop):
+            fut = MagicMock()
+            fut.result.return_value = None
+            coro.close()
+            return fut
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            tid = _open_continuable_cron_thread(
+                {"id": "j1", "name": "Brief"}, adapter, "123", loop=MagicMock(),
+            )
+        assert tid is None
+
+    def test_origin_user_is_enrolled_in_new_thread_when_supported(self):
+        from cron.scheduler import _add_continuable_cron_thread_member
+
+        adapter = MagicMock()
+        adapter.add_handoff_thread_member = AsyncMock(return_value=True)
+
+        def _run_now(coro, _loop):
+            coro.close()
+            fut = MagicMock()
+            fut.result.return_value = True
+            return fut
+
+        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_run_now):
+            enrolled = _add_continuable_cron_thread_member(
+                {"id": "j1"}, adapter, "9001", "U42", loop=MagicMock(),
+            )
+
+        assert enrolled is True
+        adapter.add_handoff_thread_member.assert_called_once_with("9001", "U42")
+
+    def test_open_thread_none_without_capability_or_loop(self):
+        """No create_handoff_thread attr, or no loop → None (no crash)."""
+        from cron.scheduler import _open_continuable_cron_thread
+
+        adapter_no_cap = MagicMock(spec=[])  # no create_handoff_thread
+        assert _open_continuable_cron_thread(
+            {"id": "j1"}, adapter_no_cap, "123", loop=MagicMock(),
+        ) is None
+
+        adapter = MagicMock()
+        adapter.create_handoff_thread = AsyncMock(return_value="9001")
+        assert _open_continuable_cron_thread(
+            {"id": "j1"}, adapter, "123", loop=None,
+        ) is None
 
     def test_seed_thread_session_creates_session_and_mirrors(self):
         """Seeding a freshly-opened thread creates the thread-keyed session via
@@ -1899,5 +1954,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 

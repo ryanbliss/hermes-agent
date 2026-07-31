@@ -2073,6 +2073,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Codex app-server turns can legitimately outlive the interactive
+        # default while running full unattended test suites. This is a hard
+        # per-turn ceiling, separate from the activity-based cron watchdog.
+        "codex_turn_timeout_seconds": 3600,
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when

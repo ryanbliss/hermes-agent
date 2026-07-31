@@ -47,6 +47,29 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
+@pytest.mark.asyncio
+async def test_handoff_thread_is_public_and_origin_user_can_be_enrolled():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread = SimpleNamespace(id=777, add_user=AsyncMock())
+    parent = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda channel_id: parent if channel_id == 555 else thread,
+        fetch_channel=AsyncMock(),
+    )
+    object_factory = sys.modules["discord"].Object
+    object_factory.reset_mock()
+
+    thread_id = await adapter.create_handoff_thread("555", "Daily report")
+    enrolled = await adapter.add_handoff_thread_member(thread_id, "42")
+
+    assert thread_id == "777"
+    assert enrolled is True
+    create_kwargs = parent.create_thread.await_args.kwargs
+    assert create_kwargs["type"] is sys.modules["discord"].ChannelType.public_thread
+    object_factory.assert_called_once_with(id=42)
+    thread.add_user.assert_awaited_once_with(object_factory.return_value)
+
+
 def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     ref_msg = SimpleNamespace(id=99, to_reference=MagicMock(return_value=reference_obj))

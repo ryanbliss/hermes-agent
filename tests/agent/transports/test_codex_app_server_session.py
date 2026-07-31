@@ -731,6 +731,56 @@ class TestSessionRetirement:
         )
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
+    def test_commentary_without_turn_completed_is_not_promoted_to_final(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "phase": "commentary",
+                "text": "I am switching to the publish workflow now.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "finish the task",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is True
+        assert r.error and "timed out" in r.error
+        assert r.should_retire is True
+
+    def test_post_tool_quiet_watchdog_trips_and_retires(self):
+        client = FakeClient()
+        # One tool completion, then total silence — no further events,
+        # no turn/completed. With a tiny post_tool_quiet_timeout the
+        # watchdog must fire before the larger turn deadline.
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "tool then silence",
+            turn_timeout=5.0,           # would be miserable to wait
+            notification_poll_timeout=0.02,
+            post_tool_quiet_timeout=0.15,
+        )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "silent" in r.error
+        # Confirm we issued turn/interrupt to free codex compute
+        assert any(method == "turn/interrupt" for (method, _) in client.requests)
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
         client = FakeClient()
@@ -798,6 +848,88 @@ class TestSessionRetirement:
         assert r.should_retire is False
         assert r.interrupted is False
 
+    def test_post_tool_watchdog_resets_on_unprojected_tool_start(self):
+        """A code-mode tool start is live activity even when its item type
+        produces no projected Hermes message until completion."""
+
+        class DelayedCompletionClient(FakeClient):
+            release_turn_complete_at = None
+
+            def take_notification(self, timeout: float = 0.0):
+                if self._notifications:
+                    next_note = self._notifications[0]
+                    method = next_note.get("method")
+                    if method == "item/started":
+                        note = self._notifications.pop(0)
+                        self.release_turn_complete_at = time.monotonic() + 0.1
+                        return note
+                    if (
+                        method == "turn/completed"
+                        and self.release_turn_complete_at is not None
+                        and time.monotonic() < self.release_turn_complete_at
+                    ):
+                        time.sleep(0.005)
+                        return None
+                return super().take_notification(timeout)
+
+        client = DelayedCompletionClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution", "id": "ex1",
+                "command": "echo hi", "cwd": "/tmp",
+                "status": "completed", "aggregatedOutput": "hi",
+                "exitCode": 0, "commandActions": [],
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "dynamicToolCall", "id": "dyn1",
+                "tool": "write_stdin", "arguments": {"session_id": 7},
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "tool, then another live tool", turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+            post_tool_quiet_timeout=0.05,
+        )
+        assert r.error is None
+        assert r.should_retire is False
+        assert r.interrupted is False
+
+    def test_turn_aborted_marker_in_text_is_terminal(self):
+        """If codex emits `<turn_aborted>` in agent text and never sends
+        turn/completed, we still exit promptly instead of burning the
+        deadline."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage", "id": "m1",
+                "text": "partial output... <turn_aborted>",
+            },
+            threadId="t", turnId="tu1",
+        )
+        # Deliberately NO turn/completed notification queued.
+        s = make_session(client)
+        r = s.run_turn(
+            "abort mid-turn", turn_timeout=2.0,
+            notification_poll_timeout=0.01,
+        )
+        assert r.interrupted is True
+        assert r.error and "turn_aborted" in r.error
+        # Should have exited fast — not waited for the full 2s deadline.
+        # (Can't measure wall clock reliably in CI; presence of the marker
+        # error string instead of a "timed out" message is the proxy.)
+        assert "timed out" not in r.error
 
 
 
@@ -895,4 +1027,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-
