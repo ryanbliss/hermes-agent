@@ -20,6 +20,7 @@ Scope (what we expose):
   - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
   - text_to_speech                       — TTS
+  - cronjob                              — create/manage Hermes scheduled jobs
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
     unblock/link)                          write ~/.hermes/kanban.db)
@@ -127,6 +128,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    # Cron scheduling is stateless (JSON-backed) and safe to dispatch through
+    # the MCP callback. Its registry check limits availability to interactive
+    # and gateway sessions, so a Discord-origin Codex turn retains the same
+    # scheduling capability as Hermes' native runtime.
+    "cronjob",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server
