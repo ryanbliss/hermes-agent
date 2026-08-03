@@ -167,15 +167,16 @@ class TestModuleSurface:
             "image_generate",
             "skill_view",
             "cronjob",
+            "memory",
         ):
             assert required in EXPOSED_TOOLS, f"missing {required!r}"
 
     def test_agent_loop_tools_not_exposed(self):
-        """delegate_task / memory / session_search / todo require the
+        """delegate_task / session_search / todo require the
         running AIAgent context to dispatch, so a stateless MCP callback
         can't drive them. They must NOT be in EXPOSED_TOOLS."""
         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
-        for agent_loop_tool in ("delegate_task", "memory", "session_search", "todo"):
+        for agent_loop_tool in ("delegate_task", "session_search", "todo"):
             assert agent_loop_tool not in EXPOSED_TOOLS, (
                 f"{agent_loop_tool!r} requires the agent loop context "
                 "and can't be reached through a stateless MCP callback"

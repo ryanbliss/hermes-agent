@@ -21,6 +21,7 @@ Scope (what we expose):
   - skill_view, skills_list              — Hermes' skill library
   - text_to_speech                       — TTS
   - cronjob                              — create/manage Hermes scheduled jobs
+  - memory                               — durable MEMORY.md / USER.md notes
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
     unblock/link)                          write ~/.hermes/kanban.db)
@@ -30,13 +31,14 @@ What we DO NOT expose:
   - read_file / write_file / patch       — codex's apply_patch + shell
   - search_files / process               — codex's shell
   - clarify                              — codex's own UX
-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
-    session_search / todo                  (model_tools.py). They require
+  - delegate_task / session_search /     — `_AGENT_LOOP_TOOLS` in Hermes
+    todo                                   (model_tools.py). They require
                                            the running AIAgent context to
                                            dispatch (mid-loop state), so a
                                            stateless MCP callback can't
-                                           drive them. See the inline
-                                           comment on EXPOSED_TOOLS below.
+                                           drive them. Memory is the exception:
+                                           its file-backed store has an explicit
+                                           standalone loader for non-agent use.
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is
@@ -105,7 +107,7 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 #   - terminal / shell / read_file / write_file / patch / search_files /
 #     process — codex's built-ins cover these and approval routes through
 #     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
+#   - delegate_task / session_search / todo — these are
 #     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
 #     the running AIAgent context to dispatch (mid-loop state), so a
 #     stateless MCP callback can't drive them. Hermes' default runtime
@@ -128,6 +130,10 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    # Memory is normally intercepted by AIAgent because it owns a live
+    # MemoryStore. The MCP bridge instead uses memory_tool.load_on_disk_store(),
+    # the supported standalone path used by other non-agent Hermes surfaces.
+    "memory",
     # Cron scheduling is stateless (JSON-backed) and safe to dispatch through
     # the MCP callback. Its registry check limits availability to interactive
     # and gateway sessions, so a Discord-origin Codex turn retains the same
@@ -153,6 +159,33 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+
+def _dispatch_tool_call(
+    tool_name: str,
+    args: dict[str, Any],
+    default_dispatch: Any,
+) -> str:
+    """Dispatch one exposed tool, adapting agent-owned tools when possible.
+
+    Most registered tools can go through ``model_tools.handle_function_call``.
+    ``memory`` is intercepted by the native agent loop, though, so the Codex
+    MCP process must construct the documented standalone on-disk store itself.
+    The store reloads under a file lock for each call, preserving concurrent
+    writes from other Discord sessions.
+    """
+    if tool_name == "memory":
+        from tools.memory_tool import load_on_disk_store, memory_tool
+
+        return memory_tool(
+            action=args.get("action"),
+            target=args.get("target", "memory"),
+            content=args.get("content"),
+            old_text=args.get("old_text"),
+            operations=args.get("operations"),
+            store=load_on_disk_store(),
+        )
+    return default_dispatch(tool_name, args)
 
 
 def _build_server() -> Any:
@@ -217,7 +250,11 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
+                    return _dispatch_tool_call(
+                        tool_name,
+                        args or {},
+                        handle_function_call,
+                    )
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
