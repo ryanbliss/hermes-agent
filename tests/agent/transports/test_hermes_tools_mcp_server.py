@@ -9,7 +9,6 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
-from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
     _signature_from_schema,
@@ -34,7 +33,6 @@ class TestSignatureFromSchema:
         assert param.kind == inspect.Parameter.KEYWORD_ONLY
         assert annots["query"] == str
         assert param.default is inspect.Parameter.empty
-
 
 
     def test_skip_private_params(self):
@@ -77,19 +75,7 @@ class TestSignatureFromSchema:
         assert annots["o"] == dict
 
 
-
-
-
-
-
-
 class TestModuleSurface:
-    def test_module_imports_clean(self):
-        from agent.transports import hermes_tools_mcp_server as m
-        assert callable(m.main)
-        assert callable(m._build_server)
-        assert isinstance(m.EXPOSED_TOOLS, tuple)
-        assert len(m.EXPOSED_TOOLS) > 0
 
     def test_exposed_tools_are_safe_subset(self):
         """We MUST NOT expose tools codex already has, because codex'
@@ -107,9 +93,30 @@ class TestModuleSurface:
             f"because codex has built-in equivalents: {leaked}"
         )
 
+    def test_fork_tools_remain_exposed(self):
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
 
+        assert {"memory", "cronjob_manage"}.issubset(EXPOSED_TOOLS)
 
+    def test_memory_uses_standalone_store(self, monkeypatch):
+        from agent.transports.hermes_tools_mcp_server import _dispatch_tool_call
+        import tools.memory_tool as memory_module
 
+        store = object()
+        calls = []
+        monkeypatch.setattr(memory_module, "load_on_disk_store", lambda: store)
+        monkeypatch.setattr(memory_module, "memory_tool", lambda **kwargs: calls.append(kwargs) or "ok")
+
+        result = _dispatch_tool_call(
+            "memory", {"action": "add", "content": "fact"},
+            lambda *_args: (_ for _ in ()).throw(AssertionError("unexpected default dispatch")),
+        )
+
+        assert result == "ok"
+        assert calls == [{
+            "action": "add", "target": "memory", "content": "fact",
+            "old_text": None, "new_text": None, "operations": None, "store": store,
+        }]
 
 
 class TestMain:
