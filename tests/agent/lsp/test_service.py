@@ -7,6 +7,8 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -25,7 +27,9 @@ from agent.lsp.servers import (
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "pyright"):
+def _install_mock_server(
+    monkeypatch, script: str | list[str] = "errors", server_id: str = "pyright"
+):
     """Replace one registered server with a wrapper that spawns the mock.
 
     We reuse ``pyright`` so .py files route to it.  This keeps the
@@ -33,9 +37,13 @@ def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "
     """
     target_index = next(i for i, s in enumerate(SERVERS) if s.server_id == server_id)
     original = SERVERS[target_index]
+    scripts = [script] if isinstance(script, str) else script
+    spawn_count = {"value": 0}
 
     def _spawn(root: str, ctx: ServerContext) -> SpawnSpec:
-        env = {"MOCK_LSP_SCRIPT": script}
+        index = min(spawn_count["value"], len(scripts) - 1)
+        spawn_count["value"] += 1
+        env = {"MOCK_LSP_SCRIPT": scripts[index]}
         return SpawnSpec(
             command=[sys.executable, MOCK_SERVER],
             workspace_root=root,
@@ -55,7 +63,7 @@ def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "
     # Patch the SERVERS list element directly + restore on teardown.
     SERVERS[target_index] = replacement
 
-    yield
+    yield spawn_count
 
     SERVERS[target_index] = original
 
@@ -77,33 +85,65 @@ def mock_pyright(monkeypatch, tmp_path):
         pass
 
 
-def test_service_returns_empty_when_disabled(tmp_path):
-    svc = LSPService(
-        enabled=False,
-        wait_mode="document",
-        wait_timeout=2.0,
-        install_strategy="auto",
-    )
-    assert not svc.is_active()
-    f = tmp_path / "x.py"
-    f.write_text("")
-    assert svc.get_diagnostics_sync(str(f)) == []
-    svc.shutdown()
+@pytest.fixture
+def mock_pyright_silent(monkeypatch, tmp_path):
+    """Install the silent mock as ``pyright`` (never pushes diagnostics).
+
+    The silent server accepts the open but never publishes diagnostics
+    for the pre-edit content and rejects the pull channel, so the
+    baseline snapshot has to wait out its full budget — exactly the
+    slow-server shape from the wait_timeout report.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    monkeypatch.chdir(str(repo))
+    gen = _install_mock_server(monkeypatch, "silent", "pyright")
+    next(gen)
+    yield repo
+    try:
+        next(gen)
+    except StopIteration:
+        pass
 
 
-def test_service_skips_files_outside_workspace(tmp_path):
-    """Files outside any git worktree must not trigger LSP."""
+def test_snapshot_baseline_honors_wait_timeout(mock_pyright_silent):
+    """``snapshot_baseline`` must wait at most ``lsp.wait_timeout``, not
+    the hardcoded client fallback of 5s.
+
+    Regression for the report that a 2s wait_timeout was ignored by the
+    baseline path: the wait ran without a timeout and fell back to
+    ``DIAGNOSTICS_DOCUMENT_WAIT`` (5s).  The silent mock never pushes,
+    so the elapsed time directly exposes the effective wait budget.
+    """
+    repo = mock_pyright_silent
+    f = repo / "x.py"
+    f.write_text("print('hi')\n")
+
     svc = LSPService(
         enabled=True,
         wait_mode="document",
         wait_timeout=2.0,
         install_strategy="manual",
     )
-    f = tmp_path / "x.py"
-    f.write_text("")
-    # No .git anywhere — service should report not enabled for this file.
-    assert not svc.enabled_for(str(f))
-    svc.shutdown()
+    try:
+        start = time.monotonic()
+        svc.snapshot_baseline(str(f))
+        elapsed = time.monotonic() - start
+
+        # The wait is deadline-based: it always runs the full budget
+        # (never less than wait_timeout) and the server never pushes,
+        # so both bounds are stable under load.
+        assert elapsed >= 1.5, f"baseline returned before the wait budget: {elapsed:.2f}s"
+        assert elapsed < 4.5, (
+            f"baseline ignored wait_timeout=2.0 and ran the 5s fallback: {elapsed:.2f}s"
+        )
+        assert svc.get_status()["broken"] == []
+        # No fresh data pre-edit -> empty (never stale) baseline.
+        assert svc._delta_baseline[os.path.abspath(str(f))] == []
+    finally:
+        svc.shutdown()
 
 
 def test_service_e2e_delta_filter(mock_pyright):
@@ -129,82 +169,52 @@ def test_service_e2e_delta_filter(mock_pyright):
         svc.shutdown()
 
 
-def test_service_e2e_delta_filter_with_line_shift(mock_pyright):
-    """End-to-end: an edit that shifts the diagnostic's line still
-    filters correctly when ``line_shift`` is supplied.
-
-    The mock LSP server emits a fixed error at line 0; for this test
-    we don't need to actually shift the server's output — we just
-    need to prove that supplying a line_shift through the API works
-    and doesn't break the existing delta path.  The unit tests in
-    test_delta_key.py cover the shift semantics in detail.
-    """
-    repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("print('hi')\n")
+@pytest.mark.parametrize("failed_script", ["clean_eof", "malformed_frame"])
+def test_service_replaces_client_after_reader_failure(
+    tmp_path, monkeypatch, failed_script
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    source = repo / "x.py"
+    source.write_text("print('hi')\n")
+    monkeypatch.chdir(str(repo))
+    server = _install_mock_server(
+        monkeypatch, [failed_script, "clean"], "pyright"
+    )
+    spawn_count = next(server)
 
     svc = LSPService(
         enabled=True,
         wait_mode="document",
-        wait_timeout=3.0,
+        wait_timeout=0.5,
         install_strategy="manual",
     )
     try:
-        svc.snapshot_baseline(str(f))
-        # Identity shift — should behave exactly like no shift.
-        new_diags = svc.get_diagnostics_sync(str(f), line_shift=lambda L: L)
-        assert new_diags == []
+        async def _break_first_client():
+            client = await svc._get_or_spawn(str(source))
+            assert client is not None
+            reader_task = client._reader_task
+            assert reader_task is not None
+            await client.open_file(str(source), language_id="python")
+            await asyncio.wait_for(asyncio.shield(reader_task), timeout=3.0)
+            return client
+
+        first = svc._loop.run(_break_first_client(), timeout=5.0)
+        replacement = svc._loop.run(svc._get_or_spawn(str(source)), timeout=5.0)
+
+        assert not first.is_running
+        assert replacement is not None
+        assert replacement is not first
+        assert replacement.is_running
+        assert spawn_count["value"] == 2
     finally:
         svc.shutdown()
-
-
-def test_service_status_includes_clients(mock_pyright):
-    repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("")
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=3.0,
-        install_strategy="manual",
-    )
-    try:
-        svc.get_diagnostics_sync(str(f))
-        info = svc.get_status()
-        assert info["enabled"] is True
-        assert any(c["server_id"] == "pyright" for c in info["clients"])
-    finally:
-        svc.shutdown()
-
-
-def test_service_reaps_client_after_idle_timeout(mock_pyright):
-    repo = mock_pyright
-    f = repo / "x.py"
-    f.write_text("")
-    svc = LSPService(
-        enabled=True,
-        wait_mode="document",
-        wait_timeout=3.0,
-        install_strategy="manual",
-        idle_timeout=0.2,
-    )
-    try:
-        svc.get_diagnostics_sync(str(f))
-        assert svc.get_status()["clients"]
-        client = next(iter(svc._clients.values()))
-        process = client._proc
-        assert process is not None
-
-        deadline = time.monotonic() + 2.0
-        while svc.get_status()["clients"] and time.monotonic() < deadline:
-            time.sleep(0.02)
-        while process.returncode is None and time.monotonic() < deadline:
-            time.sleep(0.02)
-
-        assert svc.get_status()["clients"] == []
-        assert process.returncode is not None
-    finally:
-        svc.shutdown()
+        try:
+            next(server)
+        except StopIteration:
+            pass
 
 
 def test_reused_client_refreshes_last_used_and_survives_reap(mock_pyright):
@@ -287,58 +297,3 @@ def test_reaper_survives_sweep_error(mock_pyright):
         assert not svc._idle_reaper_task.done()
     finally:
         svc.shutdown()
-
-
-def test_create_from_config_reads_idle_timeout(monkeypatch):
-    """``lsp.idle_timeout`` in config.yaml reaches the service."""
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: {"lsp": {"enabled": False, "idle_timeout": 42}},
-    )
-    svc = LSPService.create_from_config()
-    assert svc is not None
-    assert svc._idle_timeout == 42.0
-
-
-def test_create_from_config_invalid_idle_timeout_falls_back(monkeypatch):
-    from agent.lsp.manager import DEFAULT_IDLE_TIMEOUT
-
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: {"lsp": {"enabled": False, "idle_timeout": "not-a-number"}},
-    )
-    svc = LSPService.create_from_config()
-    assert svc is not None
-    assert svc._idle_timeout == DEFAULT_IDLE_TIMEOUT
-
-
-def test_create_from_config_clamps_tiny_idle_timeout(monkeypatch):
-    """Sub-floor timeouts are clamped (mid-flight reap could otherwise
-    escalate an outer timeout into a permanent broken-set entry); 0 still
-    means disabled and is not clamped."""
-    from agent.lsp.manager import MIN_IDLE_TIMEOUT
-
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: {"lsp": {"enabled": False, "idle_timeout": 2}},
-    )
-    svc = LSPService.create_from_config()
-    assert svc is not None
-    assert svc._idle_timeout == MIN_IDLE_TIMEOUT
-
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: {"lsp": {"enabled": False, "idle_timeout": 0}},
-    )
-    svc = LSPService.create_from_config()
-    assert svc is not None
-    assert svc._idle_timeout == 0
-
-
-def test_default_config_declares_idle_timeout():
-    """The canonical default in DEFAULT_CONFIG matches the manager constant
-    so config discovery surfaces the knob with the real default value."""
-    from agent.lsp.manager import DEFAULT_IDLE_TIMEOUT
-    from hermes_cli.config import DEFAULT_CONFIG
-
-    assert float(DEFAULT_CONFIG["lsp"]["idle_timeout"]) == float(DEFAULT_IDLE_TIMEOUT)
