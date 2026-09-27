@@ -486,7 +486,6 @@ class CodexAppServerSession:
         # Post-tool quiet timer: armed on each tool completion, cleared by any other activity.
         # Observability only — it never interrupts or retires (see run_turn docstring).
         last_tool_completion_at: Optional[float] = None
-        terminal_agent_message_seen = False
 
         def warn_if_quiet() -> bool:
             nonlocal last_tool_completion_at

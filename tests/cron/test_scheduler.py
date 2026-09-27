@@ -5,7 +5,6 @@ import contextvars
 import itertools
 import json
 import os
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
