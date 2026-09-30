@@ -5403,7 +5403,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a handoff thread under a text channel; returns the thread id or ``None``.
-        Falls back to seed-message + ``message.create_thread``; DMs/voice/threads can't host threads."""
+        Use a channel message so the public thread is visible in channel history.
+        DMs/voice/threads can't host threads."""
         if not self._client or not DISCORD_AVAILABLE:
             return None
         try:
@@ -5428,17 +5429,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return None
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(name=thread_name, auto_archive_duration=1440, reason=reason)
-                self._threads.mark(str(thread.id))
-                return str(thread.id)
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
-            )
+        # TextChannel.create_thread without a message defaults to PRIVATE_THREAD.
+        # A message-backed thread is public and leaves a discoverable parent entry.
         try:
             send = getattr(parent, "send", None)
             if send is None:
@@ -5451,10 +5443,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return str(thread.id)
         except Exception as fallback_error:
             logger.warning(
-                "[%s] Handoff thread: both create paths failed for parent %s: %s",
+                "[%s] Handoff thread: message-backed create failed for parent %s: %s",
                 self.name, parent_chat_id, fallback_error,
             )
             return None
+
+    async def add_handoff_thread_member(self, thread_id: str, user_id: str) -> None:
+        """Subscribe the originating user to a delivered result thread."""
+        thread = self._client.get_channel(int(thread_id))
+        if thread is None:
+            thread = await self._client.fetch_channel(int(thread_id))
+        await thread.add_user(discord.Object(id=int(user_id)))
 
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
