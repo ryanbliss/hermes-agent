@@ -267,13 +267,30 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
         if future is None:
             return None
         new_thread_id = future.result(timeout=30)
-        return str(new_thread_id) if new_thread_id else None
     except Exception as e:
         logger.debug(
             "Job '%s': create_handoff_thread failed on %s — falling back to "
             "DM-session mirror: %s",
             job.get("id", "?"), getattr(adapter, "name", "?"), e)
         return None
+
+    if not new_thread_id:
+        return None
+    # Optional platform capability: subscribe the creator without making a
+    # membership failure discard an already-created delivery destination.
+    add_member = getattr(adapter, "add_handoff_thread_member", None)
+    user_id = (job.get("origin") or {}).get("user_id")
+    if callable(add_member) and user_id:
+        try:
+            future = safe_schedule_threadsafe(
+                add_member(str(new_thread_id), str(user_id)), loop,
+            )
+            if future is not None:
+                future.result(timeout=30)
+        except Exception as exc:
+            logger.warning("Job '%s': could not enroll origin user in thread %s: %s",
+                           job.get("id", "?"), new_thread_id, exc)
+    return str(new_thread_id)
 
 
 def _seed_cron_session(

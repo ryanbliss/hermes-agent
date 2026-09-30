@@ -49,6 +49,36 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_handoff_thread_is_message_backed_and_visible(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    seed = SimpleNamespace(create_thread=AsyncMock(return_value=SimpleNamespace(id=777)))
+    parent = SimpleNamespace(send=AsyncMock(return_value=seed), create_thread=AsyncMock())
+    adapter._client = SimpleNamespace(get_channel=lambda _: parent)
+    adapter._threads = SimpleNamespace(mark=MagicMock())
+
+    assert await adapter.create_handoff_thread("555", "Hermes — digest") == "777"
+    parent.send.assert_awaited_once_with("🧵 Hermes handoff: **Hermes — digest**")
+    seed.create_thread.assert_awaited_once()
+    parent.create_thread.assert_not_awaited()
+    adapter._threads.mark.assert_called_once_with("777")
+
+
+@pytest.mark.asyncio
+async def test_handoff_thread_enrolls_user_when_thread_is_not_cached(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("plugins.platforms.discord.adapter.discord.Object", SimpleNamespace)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread = SimpleNamespace(add_user=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _: None, fetch_channel=AsyncMock(return_value=thread),
+    )
+    await adapter.add_handoff_thread_member("777", "123")
+    adapter._client.fetch_channel.assert_awaited_once_with(777)
+    assert thread.add_user.await_args.args[0].id == 123
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_whitespace_and_records_failed_final_reply(
     caplog, monkeypatch, tmp_path
 ):
