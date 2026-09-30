@@ -343,6 +343,18 @@ real_home = Path(os.environ.get("HERMES_REAL_HOME", os.environ["HOME"]))
 The agent has the same filesystem access as your user account. Use `hermes tools` to disable tools you don't want, or switch to Docker for sandboxing.
 :::
 
+On Linux with a systemd gateway, local executors and scheduled-job workers run
+in separate memory-limited scopes. Heavy builds may need a larger budget:
+
+```yaml
+terminal:
+  worker_memory_max_mb: 8192
+```
+
+The default is 4096 MiB. The effective limit cannot exceed half of physical RAM
+or the enclosing cgroup limit. `TERMINAL_LOCAL_MEMORY_MAX_MB`, if already set,
+can only tighten this budget. Increasing the budget does not disable isolation.
+
 ### Docker Backend
 
 Runs commands inside a Docker container with security hardening (all capabilities dropped, no privilege escalation, PID limits).

@@ -111,14 +111,24 @@ _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
 def _worker_memory_max_bytes() -> int:
-    """Finite per-worker cgroup limit that can never widen host risk.
+    """Finite per-worker cgroup limit bounded by the enclosing cgroup and host RAM.
     ``TERMINAL_LOCAL_MEMORY_MAX_MB`` is honored only when it *tightens* the safe
     bound (min of the gateway's cgroup-v2 ``memory.max`` and half of physical RAM,
-    capped at 4 GiB), so an oversized override cannot exceed the enclosing slice.
+    capped by terminal.worker_memory_max_mb, default 4 GiB).
 
     The proposed local-memory-guard environment override is honored when it tightens the safe bound, so this
     isolation composes with PR #57121 instead of inventing a second knob.
     """
+    from hermes_cli.config_effective import load_user_config_effective
+
+    raw_cap = load_user_config_effective().get("terminal", {}).get("worker_memory_max_mb", 4096)
+    try:
+        configured_cap = int(raw_cap) * 1024 * 1024
+        if isinstance(raw_cap, bool) or configured_cap < _MIN_WORKER_MEMORY_MAX_BYTES:
+            raise ValueError("must be at least 64 MiB")
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Invalid terminal.worker_memory_max_mb=%r; using 4 GiB", raw_cap)
+        configured_cap = _WORKER_MEMORY_MAX_CAP_BYTES
     override_bound: Optional[int] = None
     override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
     if override:
@@ -154,13 +164,15 @@ def _worker_memory_max_bytes() -> int:
             os.sysconf("SC_PAGE_SIZE")
         )
         physical_bound = min(
-            _WORKER_MEMORY_MAX_CAP_BYTES,
+            configured_cap,
             max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
         )
         candidates.append(physical_bound)
     except (OSError, ValueError, TypeError):
         pass
-    safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
+    safe_bound = min([configured_cap, *candidates]) if candidates else min(
+        configured_cap, _DEFAULT_WORKER_MEMORY_MAX_BYTES,
+    )
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
